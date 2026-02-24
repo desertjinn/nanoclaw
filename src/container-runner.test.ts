@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
-import { EventEmitter } from 'events';
-import { PassThrough } from 'stream';
+import fs from 'fs';
 
 // Sentinel markers must match container-runner.ts
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -10,10 +9,10 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 vi.mock('./config.js', () => ({
   CONTAINER_IMAGE: 'nanoclaw-agent:latest',
   CONTAINER_MAX_OUTPUT_SIZE: 10485760,
-  CONTAINER_TIMEOUT: 1800000, // 30min
+  CONTAINER_TIMEOUT: 1800000,
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
-  IDLE_TIMEOUT: 1800000, // 30min
+  IDLE_TIMEOUT: 1800000,
   TIMEZONE: 'America/Los_Angeles',
 }));
 
@@ -37,50 +36,39 @@ vi.mock('fs', async () => {
       existsSync: vi.fn(() => false),
       mkdirSync: vi.fn(),
       writeFileSync: vi.fn(),
+      renameSync: vi.fn(),
+      unlinkSync: vi.fn(),
       readFileSync: vi.fn(() => ''),
       readdirSync: vi.fn(() => []),
       statSync: vi.fn(() => ({ isDirectory: () => false })),
-      copyFileSync: vi.fn(),
+      cpSync: vi.fn(),
     },
   };
 });
 
-// Mock mount-security
-vi.mock('./mount-security.js', () => ({
-  validateAdditionalMounts: vi.fn(() => []),
+// Mock env reader
+vi.mock('./env.js', () => ({
+  readEnvFile: vi.fn(() => ({ CLAUDE_CODE_OAUTH_TOKEN: 'tok', ANTHROPIC_API_KEY: 'key' })),
 }));
 
-// Create a controllable fake ChildProcess
-function createFakeProcess() {
-  const proc = new EventEmitter() as EventEmitter & {
-    stdin: PassThrough;
-    stdout: PassThrough;
-    stderr: PassThrough;
-    kill: ReturnType<typeof vi.fn>;
-    pid: number;
-  };
-  proc.stdin = new PassThrough();
-  proc.stdout = new PassThrough();
-  proc.stderr = new PassThrough();
-  proc.kill = vi.fn();
-  proc.pid = 12345;
-  return proc;
-}
+// Mock group-folder
+vi.mock('./group-folder.js', () => ({
+  resolveGroupFolderPath: vi.fn((folder: string) => `/tmp/groups/${folder}`),
+  resolveGroupIpcPath: vi.fn((folder: string) => `/tmp/ipc/${folder}`),
+}));
 
-let fakeProc: ReturnType<typeof createFakeProcess>;
+// Controllable mock for container-runtime
+const mockSpawnJob = vi.fn();
+const mockStopJob = vi.fn();
+const mockStreamJobLogs = vi.fn();
 
-// Mock child_process.spawn
-vi.mock('child_process', async () => {
-  const actual = await vi.importActual<typeof import('child_process')>('child_process');
-  return {
-    ...actual,
-    spawn: vi.fn(() => fakeProc),
-    exec: vi.fn((_cmd: string, _opts: unknown, cb?: (err: Error | null) => void) => {
-      if (cb) cb(null);
-      return new EventEmitter();
-    }),
-  };
-});
+vi.mock('./container-runtime.js', () => ({
+  spawnJob: (...args: unknown[]) => mockSpawnJob(...args),
+  stopJob: (...args: unknown[]) => mockStopJob(...args),
+  streamJobLogs: (...args: unknown[]) => mockStreamJobLogs(...args),
+  ensureContainerRuntimeRunning: vi.fn(),
+  cleanupOrphans: vi.fn(),
+}));
 
 import { runContainerAgent, ContainerOutput } from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
@@ -99,105 +87,105 @@ const testInput = {
   isMain: false,
 };
 
-function emitOutputMarker(proc: ReturnType<typeof createFakeProcess>, output: ContainerOutput) {
-  const json = JSON.stringify(output);
-  proc.stdout.push(`${OUTPUT_START_MARKER}\n${json}\n${OUTPUT_END_MARKER}\n`);
+function makeStreamJobLogs(output: ContainerOutput, exitCode = 0) {
+  return vi.fn(async (_handle: unknown, onChunk: (chunk: string) => void, _timeout: unknown) => {
+    const json = JSON.stringify(output);
+    onChunk(`${OUTPUT_START_MARKER}\n${json}\n${OUTPUT_END_MARKER}\n`);
+    return exitCode;
+  });
 }
 
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockSpawnJob.mockResolvedValue({ name: 'nanoclaw-test-group-123', runtimeId: 'nanoclaw' });
+  mockStopJob.mockResolvedValue(undefined);
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe('container-runner timeout behavior', () => {
-  beforeEach(() => {
-    vi.useFakeTimers();
-    fakeProc = createFakeProcess();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-  });
-
-  it('timeout after output resolves as success', async () => {
+  it('normal exit after output resolves as success (streaming mode)', async () => {
     const onOutput = vi.fn(async () => {});
-    const resultPromise = runContainerAgent(
-      testGroup,
-      testInput,
-      () => {},
-      onOutput,
+    mockStreamJobLogs.mockImplementation(
+      makeStreamJobLogs({ status: 'success', result: 'Done', newSessionId: 'session-456' }),
     );
 
-    // Emit output with a result
-    emitOutputMarker(fakeProc, {
-      status: 'success',
-      result: 'Here is my response',
-      newSessionId: 'session-123',
-    });
+    const result = await runContainerAgent(testGroup, testInput, () => {}, onOutput);
 
-    // Let output processing settle
-    await vi.advanceTimersByTimeAsync(10);
-
-    // Fire the hard timeout (IDLE_TIMEOUT + 30s = 1830000ms)
-    await vi.advanceTimersByTimeAsync(1830000);
-
-    // Emit close event (as if container was stopped by the timeout)
-    fakeProc.emit('close', 137);
-
-    // Let the promise resolve
-    await vi.advanceTimersByTimeAsync(10);
-
-    const result = await resultPromise;
-    expect(result.status).toBe('success');
-    expect(result.newSessionId).toBe('session-123');
-    expect(onOutput).toHaveBeenCalledWith(
-      expect.objectContaining({ result: 'Here is my response' }),
-    );
-  });
-
-  it('timeout with no output resolves as error', async () => {
-    const onOutput = vi.fn(async () => {});
-    const resultPromise = runContainerAgent(
-      testGroup,
-      testInput,
-      () => {},
-      onOutput,
-    );
-
-    // No output emitted — fire the hard timeout
-    await vi.advanceTimersByTimeAsync(1830000);
-
-    // Emit close event
-    fakeProc.emit('close', 137);
-
-    await vi.advanceTimersByTimeAsync(10);
-
-    const result = await resultPromise;
-    expect(result.status).toBe('error');
-    expect(result.error).toContain('timed out');
-    expect(onOutput).not.toHaveBeenCalled();
-  });
-
-  it('normal exit after output resolves as success', async () => {
-    const onOutput = vi.fn(async () => {});
-    const resultPromise = runContainerAgent(
-      testGroup,
-      testInput,
-      () => {},
-      onOutput,
-    );
-
-    // Emit output
-    emitOutputMarker(fakeProc, {
-      status: 'success',
-      result: 'Done',
-      newSessionId: 'session-456',
-    });
-
-    await vi.advanceTimersByTimeAsync(10);
-
-    // Normal exit (no timeout)
-    fakeProc.emit('close', 0);
-
-    await vi.advanceTimersByTimeAsync(10);
-
-    const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+    expect(onOutput).toHaveBeenCalledWith(
+      expect.objectContaining({ result: 'Done' }),
+    );
+  });
+
+  it('job exit code non-zero resolves as error', async () => {
+    const onOutput = vi.fn(async () => {});
+    mockStreamJobLogs.mockImplementation(
+      makeStreamJobLogs({ status: 'error', result: null, error: 'agent failed' }, 1),
+    );
+
+    const result = await runContainerAgent(testGroup, testInput, () => {}, onOutput);
+
+    expect(result.status).toBe('error');
+    expect(result.error).toContain('exit');
+  });
+
+  it('writes init file to PVC IPC dir before spawning job', async () => {
+    mockStreamJobLogs.mockImplementation(
+      makeStreamJobLogs({ status: 'success', result: 'done' }),
+    );
+
+    await runContainerAgent(testGroup, testInput, () => {});
+
+    // renameSync is the atomic commit step — must have been called before spawnJob
+    const renameCalls = (fs.renameSync as ReturnType<typeof vi.fn>).mock.calls;
+    expect(renameCalls.length).toBeGreaterThanOrEqual(1);
+    const [tempPath, finalPath] = renameCalls[0];
+    expect(tempPath).toMatch(/init-\d+\.json\.tmp$/);
+    expect(finalPath).toMatch(/init-\d+\.json$/);
+    // spawnJob was called after renameSync (order guaranteed by sequential code)
+    expect(mockSpawnJob).toHaveBeenCalledTimes(1);
+    const spawnArg = mockSpawnJob.mock.calls[0][0];
+    expect(spawnArg.env.NANOCLAW_GROUP).toBe('test-group');
+  });
+
+  it('spawnJob failure returns error immediately', async () => {
+    mockSpawnJob.mockRejectedValueOnce(new Error('k8s API unavailable'));
+    const onOutput = vi.fn(async () => {});
+
+    const result = await runContainerAgent(testGroup, testInput, () => {}, onOutput);
+
+    expect(result.status).toBe('error');
+    expect(result.error).toContain('k8s API unavailable');
+    expect(mockStreamJobLogs).not.toHaveBeenCalled();
+  });
+
+  it('calls onProcess callback with JobHandle and containerName', async () => {
+    const onProcess = vi.fn();
+    mockStreamJobLogs.mockImplementation(
+      makeStreamJobLogs({ status: 'success', result: 'ok' }),
+    );
+
+    await runContainerAgent(testGroup, testInput, onProcess);
+
+    expect(onProcess).toHaveBeenCalledWith(
+      expect.objectContaining({ name: expect.stringContaining('nanoclaw-test-group'), runtimeId: 'nanoclaw' }),
+      expect.stringContaining('nanoclaw-test-group'),
+    );
+  });
+
+  it('legacy mode: parses output from stdout when onOutput not provided', async () => {
+    mockStreamJobLogs.mockImplementation(
+      makeStreamJobLogs({ status: 'success', result: 'legacy result', newSessionId: 'sess-789' }),
+    );
+
+    const result = await runContainerAgent(testGroup, testInput, () => {});
+
+    expect(result.status).toBe('success');
+    expect(result.result).toBe('legacy result');
+    expect(result.newSessionId).toBe('sess-789');
   });
 });

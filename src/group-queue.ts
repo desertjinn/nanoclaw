@@ -1,8 +1,5 @@
-import { ChildProcess } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-
-import { DATA_DIR, MAX_CONCURRENT_CONTAINERS } from './config.js';
+import { MAX_CONCURRENT_CONTAINERS } from './config.js';
+import { JobHandle, stopJob } from './container-runtime.js';
 import { logger } from './logger.js';
 
 interface QueuedTask {
@@ -20,7 +17,7 @@ interface GroupState {
   isTaskContainer: boolean;
   pendingMessages: boolean;
   pendingTasks: QueuedTask[];
-  process: ChildProcess | null;
+  jobHandle: JobHandle | null;
   containerName: string | null;
   groupFolder: string | null;
   retryCount: number;
@@ -43,7 +40,7 @@ export class GroupQueue {
         isTaskContainer: false,
         pendingMessages: false,
         pendingTasks: [],
-        process: null,
+        jobHandle: null,
         containerName: null,
         groupFolder: null,
         retryCount: 0,
@@ -123,9 +120,9 @@ export class GroupQueue {
     );
   }
 
-  registerProcess(groupJid: string, proc: ChildProcess, containerName: string, groupFolder?: string): void {
+  registerJob(groupJid: string, handle: JobHandle, containerName: string, groupFolder?: string): void {
     const state = this.getGroup(groupJid);
-    state.process = proc;
+    state.jobHandle = handle;
     state.containerName = containerName;
     if (groupFolder) state.groupFolder = groupFolder;
   }
@@ -143,43 +140,17 @@ export class GroupQueue {
   }
 
   /**
-   * Send a follow-up message to the active container via IPC file.
-   * Returns true if the message was written, false if no active container.
+   * Pattern B: each message batch spawns a new Job; follow-ups are never piped.
+   * Always returns false so callers enqueue a fresh container run.
    */
-  sendMessage(groupJid: string, text: string): boolean {
-    const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder || state.isTaskContainer) return false;
-    state.idleWaiting = false; // Agent is about to receive work, no longer idle
-
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
-    try {
-      fs.mkdirSync(inputDir, { recursive: true });
-      const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const filepath = path.join(inputDir, filename);
-      const tempPath = `${filepath}.tmp`;
-      fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text }));
-      fs.renameSync(tempPath, filepath);
-      return true;
-    } catch {
-      return false;
-    }
+  sendMessage(_groupJid: string, _text: string): boolean {
+    return false;
   }
 
   /**
-   * Signal the active container to wind down by writing a close sentinel.
+   * Pattern B: no long-lived stdin to close; this is a no-op.
    */
-  closeStdin(groupJid: string): void {
-    const state = this.getGroup(groupJid);
-    if (!state.active || !state.groupFolder) return;
-
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
-    try {
-      fs.mkdirSync(inputDir, { recursive: true });
-      fs.writeFileSync(path.join(inputDir, '_close'), '');
-    } catch {
-      // ignore
-    }
-  }
+  closeStdin(_groupJid: string): void {}
 
   private async runForGroup(
     groupJid: string,
@@ -211,7 +182,7 @@ export class GroupQueue {
       this.scheduleRetry(groupJid, state);
     } finally {
       state.active = false;
-      state.process = null;
+      state.jobHandle = null;
       state.containerName = null;
       state.groupFolder = null;
       this.activeCount--;
@@ -238,7 +209,7 @@ export class GroupQueue {
     } finally {
       state.active = false;
       state.isTaskContainer = false;
-      state.process = null;
+      state.jobHandle = null;
       state.containerName = null;
       state.groupFolder = null;
       this.activeCount--;
@@ -321,19 +292,17 @@ export class GroupQueue {
   async shutdown(_gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
 
-    // Count active containers but don't kill them — they'll finish on their own
-    // via idle timeout or container timeout. The --rm flag cleans them up on exit.
-    // This prevents WhatsApp reconnection restarts from killing working agents.
-    const activeContainers: string[] = [];
-    for (const [jid, state] of this.groups) {
-      if (state.process && !state.process.killed && state.containerName) {
-        activeContainers.push(state.containerName);
+    const stopPromises: Promise<void>[] = [];
+    for (const [, state] of this.groups) {
+      if (state.jobHandle) {
+        stopPromises.push(stopJob(state.jobHandle).catch(() => {}));
       }
     }
+    await Promise.all(stopPromises);
 
     logger.info(
-      { activeCount: this.activeCount, detachedContainers: activeContainers },
-      'GroupQueue shutting down (containers detached, not killed)',
+      { activeCount: this.activeCount, stoppedJobs: stopPromises.length },
+      'GroupQueue shutting down (active Jobs stopped)',
     );
   }
 }

@@ -1,4 +1,3 @@
-import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
@@ -10,11 +9,13 @@ import {
   TIMEZONE,
 } from './config.js';
 import { ContainerOutput, runContainerAgent, writeTasksSnapshot } from './container-runner.js';
+import { JobHandle } from './container-runtime.js';
 import {
   getAllTasks,
   getDueTasks,
   getTaskById,
   logTaskRun,
+  SessionData,
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
@@ -25,9 +26,9 @@ import { RegisteredGroup, ScheduledTask } from './types.js';
 
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
-  getSessions: () => Record<string, string>;
+  getSessions: () => Record<string, SessionData>;
   queue: GroupQueue;
-  onProcess: (groupJid: string, proc: ChildProcess, containerName: string, groupFolder: string) => void;
+  onProcess: (groupJid: string, job: JobHandle, containerName: string, groupFolder: string) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
@@ -107,8 +108,9 @@ async function runTask(
 
   // For group context mode, use the group's current session
   const sessions = deps.getSessions();
-  const sessionId =
-    task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+  const sessionData = task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+  const sessionId = sessionData?.sessionId;
+  const resumeAt = sessionData?.lastAssistantUuid;
 
   // After the task produces a result, close the container promptly.
   // Tasks are single-turn — no need to wait IDLE_TIMEOUT (30 min) for the
@@ -130,13 +132,14 @@ async function runTask(
       {
         prompt: task.prompt,
         sessionId,
+        resumeAt,
         groupFolder: task.group_folder,
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
         assistantName: ASSISTANT_NAME,
       },
-      (proc, containerName) => deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
+      (job, containerName) => deps.onProcess(task.chat_jid, job, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
