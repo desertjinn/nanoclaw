@@ -221,23 +221,30 @@ describe('K8sRuntime', () => {
   });
 
   describe('cleanupOrphans', () => {
-    it('deletes stale Jobs (no startTime, no completionTime)', async () => {
+    it('deletes all non-completed Jobs (pending and running orphans)', async () => {
       mockListNamespacedJob.mockResolvedValueOnce({
         items: [
-          { metadata: { name: 'nanoclaw-stale-1' }, status: {} },
-          { metadata: { name: 'nanoclaw-active-2' }, status: { startTime: '2024-01-01T00:00:00Z' } },
+          { metadata: { name: 'nanoclaw-pending-1' }, status: {} },
+          { metadata: { name: 'nanoclaw-running-2' }, status: { startTime: '2024-01-01T00:00:00Z' } },
+          {
+            metadata: { name: 'nanoclaw-done-3' },
+            status: { startTime: '2024-01-01T00:00:00Z', completionTime: '2024-01-01T00:01:00Z' },
+          },
         ],
       });
       mockDeleteNamespacedJob.mockResolvedValue({});
 
       await new K8sRuntime().cleanupOrphans();
 
-      expect(mockDeleteNamespacedJob).toHaveBeenCalledTimes(1);
+      expect(mockDeleteNamespacedJob).toHaveBeenCalledTimes(2);
       expect(mockDeleteNamespacedJob).toHaveBeenCalledWith(
-        expect.objectContaining({ name: 'nanoclaw-stale-1' }),
+        expect.objectContaining({ name: 'nanoclaw-pending-1' }),
+      );
+      expect(mockDeleteNamespacedJob).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'nanoclaw-running-2' }),
       );
       expect(logger.info).toHaveBeenCalledWith(
-        { count: 1 },
+        { count: 2 },
         'Deleted stale Kubernetes Jobs',
       );
     });
