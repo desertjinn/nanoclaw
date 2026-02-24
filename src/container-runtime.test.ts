@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mock logger
 vi.mock('./logger.js', () => ({
@@ -10,136 +10,323 @@ vi.mock('./logger.js', () => ({
   },
 }));
 
-// Mock child_process — store the mock fn so tests can configure it
-const mockExecSync = vi.fn();
-vi.mock('child_process', () => ({
-  execSync: (...args: unknown[]) => mockExecSync(...args),
+// ─── K8s mocks ────────────────────────────────────────────────────────────────
+
+const {
+  mockCreateNamespacedJob,
+  mockDeleteNamespacedJob,
+  mockListNamespacedJob,
+  mockReadNamespacedJob,
+  mockListNamespacedPod,
+  mockReadNamespacedPodLog,
+} = vi.hoisted(() => ({
+  mockCreateNamespacedJob: vi.fn(),
+  mockDeleteNamespacedJob: vi.fn(),
+  mockListNamespacedJob: vi.fn(),
+  mockReadNamespacedJob: vi.fn(),
+  mockListNamespacedPod: vi.fn(),
+  mockReadNamespacedPodLog: vi.fn(),
 }));
 
-import {
-  CONTAINER_RUNTIME_BIN,
-  readonlyMountArgs,
-  stopContainer,
-  ensureContainerRuntimeRunning,
-  cleanupOrphans,
-} from './container-runtime.js';
+vi.mock('@kubernetes/client-node', () => {
+  class BatchV1Api {
+    createNamespacedJob = mockCreateNamespacedJob;
+    deleteNamespacedJob = mockDeleteNamespacedJob;
+    listNamespacedJob = mockListNamespacedJob;
+    readNamespacedJob = mockReadNamespacedJob;
+  }
+  class CoreV1Api {
+    listNamespacedPod = mockListNamespacedPod;
+    readNamespacedPodLog = mockReadNamespacedPodLog;
+  }
+  class KubeConfig {
+    loadFromCluster = vi.fn();
+    makeApiClient(ApiClass: unknown) {
+      if (ApiClass === BatchV1Api) return new BatchV1Api();
+      return new CoreV1Api();
+    }
+  }
+  return { KubeConfig, BatchV1Api, CoreV1Api };
+});
+
+// ─── Docker mocks ─────────────────────────────────────────────────────────────
+
+const { mockExecSync } = vi.hoisted(() => ({ mockExecSync: vi.fn() }));
+
+vi.mock('child_process', async () => {
+  const actual = await vi.importActual<typeof import('child_process')>('child_process');
+  return {
+    ...actual,
+    execSync: (...args: unknown[]) => mockExecSync(...args),
+  };
+});
+
+// ─── Imports ──────────────────────────────────────────────────────────────────
+
+import { DockerRuntime } from './docker-runtime.js';
+import { K8sRuntime } from './k8s-runtime.js';
 import { logger } from './logger.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
 });
 
-// --- Pure functions ---
+// ─── DockerRuntime ────────────────────────────────────────────────────────────
 
-describe('readonlyMountArgs', () => {
-  it('returns -v flag with :ro suffix', () => {
-    const args = readonlyMountArgs('/host/path', '/container/path');
-    expect(args).toEqual(['-v', '/host/path:/container/path:ro']);
+describe('DockerRuntime', () => {
+  describe('ensureRunning', () => {
+    it('does nothing when docker info succeeds', () => {
+      mockExecSync.mockReturnValueOnce('');
+      new DockerRuntime().ensureRunning();
+      expect(mockExecSync).toHaveBeenCalledWith('docker info', { stdio: 'pipe', timeout: 10000 });
+      expect(logger.debug).toHaveBeenCalledWith('Container runtime already running');
+    });
+
+    it('throws when docker info fails', () => {
+      mockExecSync.mockImplementationOnce(() => { throw new Error('no daemon'); });
+      expect(() => new DockerRuntime().ensureRunning()).toThrow(
+        'Container runtime is required but failed to start',
+      );
+      expect(logger.error).toHaveBeenCalled();
+    });
+  });
+
+  describe('cleanupOrphans', () => {
+    it('stops orphaned nanoclaw containers', async () => {
+      mockExecSync.mockReturnValueOnce('nanoclaw-group1-111\nnanoclaw-group2-222\n');
+      mockExecSync.mockReturnValue('');
+
+      await new DockerRuntime().cleanupOrphans();
+
+      expect(mockExecSync).toHaveBeenCalledTimes(3);
+      expect(logger.info).toHaveBeenCalledWith(
+        { count: 2, names: ['nanoclaw-group1-111', 'nanoclaw-group2-222'] },
+        'Stopped orphaned containers',
+      );
+    });
+
+    it('does nothing when no orphans exist', async () => {
+      mockExecSync.mockReturnValueOnce('');
+      await new DockerRuntime().cleanupOrphans();
+      expect(mockExecSync).toHaveBeenCalledTimes(1);
+      expect(logger.info).not.toHaveBeenCalled();
+    });
+
+    it('warns and continues when ps fails', async () => {
+      mockExecSync.mockImplementationOnce(() => { throw new Error('docker not available'); });
+      await new DockerRuntime().cleanupOrphans();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error) }),
+        'Failed to clean up orphaned containers',
+      );
+    });
   });
 });
 
-describe('stopContainer', () => {
-  it('returns stop command using CONTAINER_RUNTIME_BIN', () => {
-    expect(stopContainer('nanoclaw-test-123')).toBe(
-      `${CONTAINER_RUNTIME_BIN} stop nanoclaw-test-123`,
-    );
+// ─── K8sRuntime ───────────────────────────────────────────────────────────────
+
+describe('K8sRuntime', () => {
+  describe('ensureRunning', () => {
+    it('is a no-op and logs debug', () => {
+      new K8sRuntime().ensureRunning();
+      expect(logger.debug).toHaveBeenCalledWith(
+        'Using Kubernetes Jobs API — no runtime check needed',
+      );
+    });
+  });
+
+  describe('spawnContainer', () => {
+    it('creates a namespaced Job with PVC mounts and returns a handle', async () => {
+      mockCreateNamespacedJob.mockResolvedValueOnce({});
+
+      const handle = await new K8sRuntime().spawnContainer({
+        name: 'nanoclaw-main-123',
+        image: 'ghcr.io/desertjinn/nanoclaw-agent:latest',
+        stdin: '{"prompt":"hello"}',
+        env: { TZ: 'UTC', NANOCLAW_GROUP: 'test-group' },
+      });
+
+      expect(mockCreateNamespacedJob).toHaveBeenCalledTimes(1);
+      const call = mockCreateNamespacedJob.mock.calls[0][0];
+      expect(call.namespace).toBe('nanoclaw');
+      expect(call.body.metadata.name).toBe('nanoclaw-main-123');
+      expect(call.body.spec.backoffLimit).toBe(0);
+      expect(call.body.spec.ttlSecondsAfterFinished).toBe(60);
+
+      // Verify PVC volume mounts with subPath isolation
+      const volumeMounts: Array<{ name: string; mountPath: string; subPath?: string }> =
+        call.body.spec.template.spec.containers[0].volumeMounts;
+      const ipcMount = volumeMounts.find((m) => m.mountPath === '/workspace/ipc');
+      expect(ipcMount).toBeDefined();
+      expect(ipcMount!.subPath).toBe('ipc/test-group');
+      const groupMount = volumeMounts.find((m) => m.mountPath === '/workspace/groups/test-group');
+      expect(groupMount).toBeDefined();
+      expect(groupMount!.subPath).toBe('groups/test-group');
+
+      // NANOCLAW_INPUT must NOT be present — init goes via PVC file
+      const envVars: Array<{ name: string; value: string }> =
+        call.body.spec.template.spec.containers[0].env;
+      expect(envVars.find((e) => e.name === 'NANOCLAW_INPUT')).toBeUndefined();
+      // NANOCLAW_GROUP is filtered out before forwarding to the container
+      expect(envVars.find((e) => e.name === 'NANOCLAW_GROUP')).toBeUndefined();
+
+      expect(handle).toEqual({ name: 'nanoclaw-main-123', runtimeId: 'nanoclaw' });
+      expect(logger.info).toHaveBeenCalledWith(
+        expect.objectContaining({ jobName: 'nanoclaw-main-123' }),
+        'Kubernetes Job created',
+      );
+    });
+
+    it('passes fsGroup: 1000 in pod securityContext', async () => {
+      mockCreateNamespacedJob.mockResolvedValueOnce({});
+
+      await new K8sRuntime().spawnContainer({
+        name: 'nanoclaw-test-456',
+        image: 'nanoclaw-agent:latest',
+        stdin: '{}',
+        env: { NANOCLAW_GROUP: 'my-group' },
+      });
+
+      const podSpec = mockCreateNamespacedJob.mock.calls[0][0].body.spec.template.spec;
+      expect(podSpec.securityContext.fsGroup).toBe(1000);
+      expect(podSpec.securityContext.runAsUser).toBe(1000);
+    });
+  });
+
+  describe('stopContainer', () => {
+    it('deletes the Job by name', async () => {
+      mockDeleteNamespacedJob.mockResolvedValueOnce({});
+
+      await new K8sRuntime().stopContainer({ name: 'nanoclaw-main-999', runtimeId: 'nanoclaw' });
+
+      expect(mockDeleteNamespacedJob).toHaveBeenCalledWith({
+        name: 'nanoclaw-main-999',
+        namespace: 'nanoclaw',
+        body: { propagationPolicy: 'Background' },
+      });
+    });
+
+    it('warns but does not throw when delete fails', async () => {
+      mockDeleteNamespacedJob.mockRejectedValueOnce(new Error('not found'));
+
+      await expect(
+        new K8sRuntime().stopContainer({ name: 'nanoclaw-gone', runtimeId: 'nanoclaw' }),
+      ).resolves.toBeUndefined();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error) }),
+        'Failed to delete Kubernetes Job',
+      );
+    });
+  });
+
+  describe('cleanupOrphans', () => {
+    it('deletes all non-completed Jobs (pending and running orphans)', async () => {
+      mockListNamespacedJob.mockResolvedValueOnce({
+        items: [
+          { metadata: { name: 'nanoclaw-pending-1' }, status: {} },
+          { metadata: { name: 'nanoclaw-running-2' }, status: { startTime: '2024-01-01T00:00:00Z' } },
+          {
+            metadata: { name: 'nanoclaw-done-3' },
+            status: { startTime: '2024-01-01T00:00:00Z', completionTime: '2024-01-01T00:01:00Z' },
+          },
+        ],
+      });
+      mockDeleteNamespacedJob.mockResolvedValue({});
+
+      await new K8sRuntime().cleanupOrphans();
+
+      expect(mockDeleteNamespacedJob).toHaveBeenCalledTimes(2);
+      expect(mockDeleteNamespacedJob).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'nanoclaw-pending-1' }),
+      );
+      expect(mockDeleteNamespacedJob).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'nanoclaw-running-2' }),
+      );
+      expect(logger.info).toHaveBeenCalledWith(
+        { count: 2 },
+        'Deleted stale Kubernetes Jobs',
+      );
+    });
+
+    it('warns and does not throw when list fails', async () => {
+      mockListNamespacedJob.mockRejectedValueOnce(new Error('k8s unreachable'));
+
+      await new K8sRuntime().cleanupOrphans();
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.any(Error) }),
+        'Failed to clean up orphaned Kubernetes Jobs',
+      );
+    });
   });
 });
 
-// --- ensureContainerRuntimeRunning ---
+// ─── Dispatcher (container-runtime.ts) ───────────────────────────────────────
+//
+// The dispatcher calls selectRuntime() at module load time, so we must
+// reset modules and re-import with a fresh env for each selection test.
 
-describe('ensureContainerRuntimeRunning', () => {
-  it('does nothing when runtime is already running', () => {
+describe('runtime dispatcher', () => {
+  const savedEnv = process.env.CONTAINER_RUNTIME;
+
+  afterEach(() => {
+    if (savedEnv === undefined) {
+      delete process.env.CONTAINER_RUNTIME;
+    } else {
+      process.env.CONTAINER_RUNTIME = savedEnv;
+    }
+    vi.resetModules();
+  });
+
+  it('selects DockerRuntime when CONTAINER_RUNTIME=docker', async () => {
+    process.env.CONTAINER_RUNTIME = 'docker';
+    vi.resetModules();
+    const mod = await import('./container-runtime.js');
+    // Docker ensureRunning calls execSync('docker info', ...)
     mockExecSync.mockReturnValueOnce('');
-
-    ensureContainerRuntimeRunning();
-
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
-    expect(mockExecSync).toHaveBeenCalledWith(
-      `${CONTAINER_RUNTIME_BIN} info`,
-      { stdio: 'pipe', timeout: 10000 },
-    );
-    expect(logger.debug).toHaveBeenCalledWith('Container runtime already running');
+    mod.ensureContainerRuntimeRunning();
+    expect(mockExecSync).toHaveBeenCalledWith('docker info', expect.any(Object));
   });
 
-  it('throws when docker info fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
-      throw new Error('Cannot connect to the Docker daemon');
-    });
-
-    expect(() => ensureContainerRuntimeRunning()).toThrow(
-      'Container runtime is required but failed to start',
-    );
-    expect(logger.error).toHaveBeenCalled();
-  });
-});
-
-// --- cleanupOrphans ---
-
-describe('cleanupOrphans', () => {
-  it('stops orphaned nanoclaw containers', () => {
-    // docker ps returns container names, one per line
-    mockExecSync.mockReturnValueOnce('nanoclaw-group1-111\nnanoclaw-group2-222\n');
-    // stop calls succeed
-    mockExecSync.mockReturnValue('');
-
-    cleanupOrphans();
-
-    // ps + 2 stop calls
-    expect(mockExecSync).toHaveBeenCalledTimes(3);
-    expect(mockExecSync).toHaveBeenNthCalledWith(
-      2,
-      `${CONTAINER_RUNTIME_BIN} stop nanoclaw-group1-111`,
-      { stdio: 'pipe' },
-    );
-    expect(mockExecSync).toHaveBeenNthCalledWith(
-      3,
-      `${CONTAINER_RUNTIME_BIN} stop nanoclaw-group2-222`,
-      { stdio: 'pipe' },
-    );
-    expect(logger.info).toHaveBeenCalledWith(
-      { count: 2, names: ['nanoclaw-group1-111', 'nanoclaw-group2-222'] },
-      'Stopped orphaned containers',
-    );
-  });
-
-  it('does nothing when no orphans exist', () => {
+  it('selects DockerRuntime when CONTAINER_RUNTIME is unset (default)', async () => {
+    delete process.env.CONTAINER_RUNTIME;
+    vi.resetModules();
+    const mod = await import('./container-runtime.js');
     mockExecSync.mockReturnValueOnce('');
-
-    cleanupOrphans();
-
-    expect(mockExecSync).toHaveBeenCalledTimes(1);
-    expect(logger.info).not.toHaveBeenCalled();
+    mod.ensureContainerRuntimeRunning();
+    expect(mockExecSync).toHaveBeenCalledWith('docker info', expect.any(Object));
   });
 
-  it('warns and continues when ps fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
-      throw new Error('docker not available');
-    });
+  it('selects K8sRuntime when CONTAINER_RUNTIME=k8s', async () => {
+    process.env.CONTAINER_RUNTIME = 'k8s';
+    vi.resetModules();
+    const mod = await import('./container-runtime.js');
+    // K8s ensureRunning is a no-op that calls logger.debug
+    mod.ensureContainerRuntimeRunning();
+    expect(logger.debug).toHaveBeenCalledWith(
+      'Using Kubernetes Jobs API — no runtime check needed',
+    );
+    expect(mockExecSync).not.toHaveBeenCalled();
+  });
 
-    cleanupOrphans(); // should not throw
-
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ err: expect.any(Error) }),
-      'Failed to clean up orphaned containers',
+  it('selects K8sRuntime when CONTAINER_RUNTIME=kubernetes', async () => {
+    process.env.CONTAINER_RUNTIME = 'kubernetes';
+    vi.resetModules();
+    const mod = await import('./container-runtime.js');
+    mod.ensureContainerRuntimeRunning();
+    expect(logger.debug).toHaveBeenCalledWith(
+      'Using Kubernetes Jobs API — no runtime check needed',
     );
   });
 
-  it('continues stopping remaining containers when one stop fails', () => {
-    mockExecSync.mockReturnValueOnce('nanoclaw-a-1\nnanoclaw-b-2\n');
-    // First stop fails
-    mockExecSync.mockImplementationOnce(() => {
-      throw new Error('already stopped');
-    });
-    // Second stop succeeds
-    mockExecSync.mockReturnValueOnce('');
-
-    cleanupOrphans(); // should not throw
-
-    expect(mockExecSync).toHaveBeenCalledTimes(3);
-    expect(logger.info).toHaveBeenCalledWith(
-      { count: 2, names: ['nanoclaw-a-1', 'nanoclaw-b-2'] },
-      'Stopped orphaned containers',
-    );
+  it('exports the public API surface', async () => {
+    vi.resetModules();
+    const mod = await import('./container-runtime.js');
+    expect(typeof mod.ensureContainerRuntimeRunning).toBe('function');
+    expect(typeof mod.spawnJob).toBe('function');
+    expect(typeof mod.stopJob).toBe('function');
+    expect(typeof mod.streamJobLogs).toBe('function');
+    expect(typeof mod.cleanupOrphans).toBe('function');
   });
 });

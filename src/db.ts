@@ -88,6 +88,13 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add last_assistant_uuid column to sessions if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(`ALTER TABLE sessions ADD COLUMN last_assistant_uuid TEXT`);
+  } catch {
+    /* column already exists */
+  }
+
   // Add is_bot_message column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
@@ -481,26 +488,38 @@ export function setRouterState(key: string, value: string): void {
 
 // --- Session accessors ---
 
-export function getSession(groupFolder: string): string | undefined {
+export interface SessionData {
+  sessionId: string;
+  lastAssistantUuid?: string;
+}
+
+export function getSession(groupFolder: string): SessionData | undefined {
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
-    .get(groupFolder) as { session_id: string } | undefined;
-  return row?.session_id;
+    .prepare('SELECT session_id, last_assistant_uuid FROM sessions WHERE group_folder = ?')
+    .get(groupFolder) as { session_id: string; last_assistant_uuid: string | null } | undefined;
+  if (!row) return undefined;
+  return {
+    sessionId: row.session_id,
+    lastAssistantUuid: row.last_assistant_uuid ?? undefined,
+  };
 }
 
-export function setSession(groupFolder: string, sessionId: string): void {
+export function setSession(groupFolder: string, sessionId: string, lastAssistantUuid?: string): void {
   db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
-  ).run(groupFolder, sessionId);
+    'INSERT OR REPLACE INTO sessions (group_folder, session_id, last_assistant_uuid) VALUES (?, ?, ?)',
+  ).run(groupFolder, sessionId, lastAssistantUuid ?? null);
 }
 
-export function getAllSessions(): Record<string, string> {
+export function getAllSessions(): Record<string, SessionData> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
-  const result: Record<string, string> = {};
+    .prepare('SELECT group_folder, session_id, last_assistant_uuid FROM sessions')
+    .all() as Array<{ group_folder: string; session_id: string; last_assistant_uuid: string | null }>;
+  const result: Record<string, SessionData> = {};
   for (const row of rows) {
-    result[row.group_folder] = row.session_id;
+    result[row.group_folder] = {
+      sessionId: row.session_id,
+      lastAssistantUuid: row.last_assistant_uuid ?? undefined,
+    };
   }
   return result;
 }

@@ -25,6 +25,7 @@ import {
   getNewMessages,
   getRouterState,
   initDatabase,
+  SessionData,
   setRegisteredGroup,
   setRouterState,
   setSession,
@@ -43,7 +44,7 @@ import { logger } from './logger.js';
 export { escapeXml, formatMessages } from './router.js';
 
 let lastTimestamp = '';
-let sessions: Record<string, string> = {};
+let sessions: Record<string, SessionData> = {};
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
@@ -233,7 +234,9 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
-  const sessionId = sessions[group.folder];
+  const sessionData = sessions[group.folder];
+  const sessionId = sessionData?.sessionId;
+  const resumeAt = sessionData?.lastAssistantUuid;
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -260,12 +263,16 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
+  // Wrap onOutput to track session ID and lastAssistantUuid from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          const preservedUuid = output.lastAssistantUuid ?? sessions[group.folder]?.lastAssistantUuid;
+          sessions[group.folder] = {
+            sessionId: output.newSessionId,
+            lastAssistantUuid: preservedUuid,
+          };
+          setSession(group.folder, output.newSessionId, preservedUuid);
         }
         await onOutput(output);
       }
@@ -277,18 +284,22 @@ async function runAgent(
       {
         prompt,
         sessionId,
+        resumeAt,
         groupFolder: group.folder,
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
       },
-      (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
+      (job, containerName) => queue.registerJob(chatJid, job, containerName, group.folder),
       wrappedOnOutput,
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[group.folder] = {
+        sessionId: output.newSessionId,
+        lastAssistantUuid: output.lastAssistantUuid ?? sessions[group.folder]?.lastAssistantUuid,
+      };
+      setSession(group.folder, output.newSessionId, output.lastAssistantUuid);
     }
 
     if (output.status === 'error') {
@@ -454,7 +465,7 @@ async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,
-    onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    onProcess: (groupJid, job, containerName, groupFolder) => queue.registerJob(groupJid, job, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);
       if (!channel) {

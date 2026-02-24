@@ -14,6 +14,7 @@ export interface SkillOverlapInfo {
   name: string;
   modifies: string[];
   npmDependencies: string[];
+  conflicts: string[];
 }
 
 /**
@@ -30,6 +31,7 @@ export function extractOverlapInfo(manifest: SkillManifest, dirName: string): Sk
     name: dirName,
     modifies: manifest.modifies ?? [],
     npmDependencies: npmDeps,
+    conflicts: manifest.conflicts ?? [],
   };
 }
 
@@ -45,6 +47,11 @@ export function computeOverlapMatrix(skills: SkillOverlapInfo[]): MatrixEntry[] 
     for (let j = i + 1; j < skills.length; j++) {
       const a = skills[i];
       const b = skills[j];
+      // Skip pairs declared as mutually exclusive
+      const aConflicts = a.conflicts ?? [];
+      const bConflicts = b.conflicts ?? [];
+      if (aConflicts.includes(b.name) || bConflicts.includes(a.name)) continue;
+
       const reasons: string[] = [];
 
       // Check shared modifies entries
