@@ -15,6 +15,6 @@ structured:
   env_additions:
     - TELEGRAM_BOT_TOKEN
     - TELEGRAM_ONLY
-conflicts: []
+conflicts: [add-discord]
 depends: []
 test: "npx vitest run src/channels/telegram.test.ts"
