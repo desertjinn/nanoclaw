@@ -1,3 +1,15 @@
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src/ ./src/
+
+RUN npm run build
+
 FROM node:20-slim
 
 WORKDIR /app
@@ -5,12 +17,8 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev
 
-COPY tsconfig.json ./
-COPY src/ ./src/
+COPY --from=builder /app/dist ./dist
 
-RUN npm run build
-
-# Non-root user, read-only root filesystem
 RUN chown -R node:node /app
 USER node
 
